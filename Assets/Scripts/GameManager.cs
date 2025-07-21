@@ -3,59 +3,39 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using UnityEngine;
-using static UnityEngine.Rendering.DebugUI.Table;
 
+/// <summary>
+/// Responsive screen-fit board; gameplay, scoring, save/load, SFX, and level progression.
+/// </summary>
 public class GameManager : MonoBehaviour
 {
-    //[SerializeField] Card CardPrefab;
-    //[SerializeField] Transform gridTransform;
+    [Header("Board Config (fallback if no Level Sequence)")]
+    public int rows = 4;
+    public int columns = 3;
 
-    //[SerializeField] private Sprite[] sprites;
+    [Tooltip("Percent of screen dimension used as outer margin on EACH side. 0.05 = 5%.")]
+    [Range(0f, 0.25f)] public float screenMarginPercent = 0.05f;
 
-    //private List<Sprite> spritepairs;
+    [Tooltip("Gap between cards as % of card width. 0.08 = 8% gap.")]
+    [Range(0f, 0.25f)] public float gapPercent = 0.08f;
 
-    //private void PrepaiSprites()
-    //{
-    //    spritepairs = new List<Sprite>();
-
-    //    for (int i = 0; i < sprites.Length; i++)
-    //    {
-    //        spritepairs.Add(sprites[i]);
-    //        spritepairs.Add(sprites[i]);
-    //    }
-
-
-    //}
-
-    //private void ShuffleSprite(List<Sprite> spriteList)
-    //{
-    //    for (int i = spriteList.Count - 1; i > 0; i--)
-    //    {
-    //        int randomIndex = UnityEngine.Random.Range(0, i + 1);
-
-    //        Sprite tempSprite = spriteList[i];
-    //        spriteList[i] = spriteList[randomIndex];
-    //        spriteList[randomIndex] = tempSprite;
-    //    }
-    //}
-
-    [Header("Board Config")]
-    public int rows;
-    public int columns;
-    public Vector2 boardSize = new Vector2(8f, 6f);  // world units width x height
-    public float padding = 0.2f;
+    [Header("Level Sequence (optional)")]
+    [Tooltip("Add row/column pairs here to define progressive levels. If empty, rows/columns above are reused every level.")]
+    public List<Vector2Int> levelLayouts = new();     // e.g., (2x2), (2x3), (3x4), (4x5)...
+    public bool loopSequence = true;                   // wrap after last?
+    private int currentLevelIndex = 0;
 
     [Header("Assets")]
     public Card cardPrefab;
     public Sprite backSprite;
-    public List<Sprite> frontSprites; // at least half of (rows*cols)
+    public List<Sprite> frontSprites;
 
     [Header("Gameplay Settings")]
     public float flipDuration = 0.3f;
     public float mismatchFlipBackDelay = 0.75f;
     public int baseMatchPoints = 10;
     public int mismatchPenalty = -2;
-    public int comboIncrement = 1;  // each successful chain increases multiplier
+    public int comboIncrement = 1;
     public bool autoLoad = true;
 
     [Header("Audio")]
@@ -71,31 +51,83 @@ public class GameManager : MonoBehaviour
     public bool InputAllowed { get; private set; } = true;
 
     // Internal
-    private readonly List<Card> cards = new List<Card>();
-    private readonly Queue<Card> comparisonQueue = new Queue<Card>(); // order of revealed
-    private bool comparisonWorkerRunning = false;
+    private readonly List<Card> cards = new();
+    private readonly Queue<Card> comparisonQueue = new();
+    private bool comparisonWorkerRunning;
 
     private int score;
-    private int combo;          // number of consecutive matches
+    private int combo;
     private bool gameFinished;
+
+    // Prefab design size (unscaled)
+    private float prefabDesignW = 1f;
+    private float prefabDesignH = 1f;
+
+    private void Awake()
+    {
+        CachePrefabDesignSize();
+    }
 
     private void Start()
     {
         if (clearSaveOnStart) SaveSystem.Clear();
+
         if (autoLoad && SaveSystem.HasSave())
-        {
             LoadGame();
+        else
+            StartLevel(currentLevelIndex); // start from 0
+    }
+
+    #region Level Management
+    private Vector2Int GetLayoutForLevel(int levelIdx)
+    {
+        if (levelLayouts != null && levelLayouts.Count > 0)
+        {
+            levelIdx = Mathf.Clamp(levelIdx, 0, levelLayouts.Count - 1);
+            return levelLayouts[levelIdx];
+        }
+        return new Vector2Int(rows, columns);
+    }
+    private void StartLevel(int levelIdx)
+    {
+        currentLevelIndex = Mathf.Max(0, levelIdx);
+        Vector2Int layout = GetLayoutForLevel(currentLevelIndex);
+
+        PrepareLevelSprites(); // Ensure a different sprite set/order
+        NewGame(layout.x, layout.y);
+    }
+    private void AdvanceLevel()
+    {
+        int next = currentLevelIndex + 1;
+        if (levelLayouts != null && levelLayouts.Count > 0)
+        {
+            if (next >= levelLayouts.Count)
+                next = loopSequence ? 0 : levelLayouts.Count - 1;
         }
         else
         {
-            NewGame(rows, columns);
+            // no sequence defined: reuse same layout
+            next = 0;
         }
+
+        StartLevel(next);
     }
+
+    private IEnumerator LevelCompleteRoutine()
+    {
+        InputAllowed = false;
+        PlayGameOverSfx(); // end board SFX
+        yield return new WaitForSeconds(1.0f); // short pause so player can see board cleared
+        InputAllowed = true;
+        AdvanceLevel();
+    }
+    #endregion
 
     public void NewGame(int r, int c)
     {
-        rows = r;
-        columns = c;
+        rows = Mathf.Max(1, r);
+        columns = Mathf.Max(1, c);
+
         ClearBoard();
 
         int total = rows * columns;
@@ -106,7 +138,6 @@ public class GameManager : MonoBehaviour
             total = rows * columns;
         }
 
-        // Build ID list (pairs)
         int pairCount = total / 2;
         if (frontSprites.Count < pairCount)
         {
@@ -114,14 +145,9 @@ public class GameManager : MonoBehaviour
             return;
         }
 
-        List<int> ids = new List<int>(pairCount * 2);
-        for (int i = 0; i < pairCount; i++)
-        {
-            ids.Add(i);
-            ids.Add(i);
-        }
-
-        // Shuffle
+        // Build shuffled ID list
+        List<int> ids = new(pairCount * 2);
+        for (int i = 0; i < pairCount; i++) { ids.Add(i); ids.Add(i); }
         for (int i = 0; i < ids.Count; i++)
         {
             int swap = UnityEngine.Random.Range(i, ids.Count);
@@ -129,48 +155,130 @@ public class GameManager : MonoBehaviour
         }
 
         CreateAndPlaceCards(ids);
+
         score = 0;
         combo = 0;
         gameFinished = false;
         Persist();
     }
 
+    /// <summary>
+    /// Instantiate, screen-fit scale, position, and init all cards.
+    /// </summary>
     private void CreateAndPlaceCards(List<int> ids)
     {
-        // Compute card size
-        float usableWidth = boardSize.x - padding * (columns + 1);
-        float usableHeight = boardSize.y - padding * (rows + 1);
-        float cardSize = Mathf.Min(usableWidth / columns, usableHeight / rows);
-
-        Vector2 start = new Vector2(-boardSize.x * 0.5f + padding + cardSize * 0.5f,
-                                    boardSize.y * 0.5f - padding - cardSize * 0.5f);
-
-        for (int index = 0; index < ids.Count; index++)
+        Camera cam = Camera.main;
+        if (!cam)
         {
-            int row = index / columns;
-            int col = index % columns;
+            Debug.LogError("GameManager: No MainCamera found.");
+            return;
+        }
+
+        // Camera world size
+        float worldH = 2f * cam.orthographicSize;
+        float worldW = worldH * cam.aspect;
+
+        // Margins
+        float margin = Mathf.Clamp01(screenMarginPercent);
+        float usableW = worldW * (1f - margin * 2f);
+        float usableH = worldH * (1f - margin * 2f);
+
+        // Prefab aspect
+        float aspect = prefabDesignH / prefabDesignW; // height per 1 width
+
+        // Solve card width from width constraint
+        float gapFrac = Mathf.Clamp01(gapPercent);
+        float denomW = columns + (columns - 1) * gapFrac;
+        float cardW_fromWidth = usableW / denomW;
+
+        // Solve card width from height constraint (height uses aspect)
+        float denomH = (rows + (rows - 1) * gapFrac) * aspect;
+        float cardW_fromHeight = usableH / denomH;
+
+        // Choose min to fit both
+        float cardW = Mathf.Min(cardW_fromWidth, cardW_fromHeight);
+        float cardH = cardW * aspect;
+        float gap = cardW * gapFrac;
+
+        // Total board size
+        float totalW = columns * cardW + (columns - 1) * gap;
+        float totalH = rows * cardH + (rows - 1) * gap;
+
+        // Top-left start (center grid)
+        Vector2 start = new(
+            -totalW * 0.5f + cardW * 0.5f,
+            totalH * 0.5f - cardH * 0.5f
+        );
+
+        // Scale factor to convert prefab width to cardW
+        float scaleFactor = (cardW / prefabDesignW)/2;
+
+        // Instantiate & place
+        for (int i = 0; i < ids.Count; i++)
+        {
+            int row = i / columns;
+            int colIdx = i % columns;
 
             Card card = Instantiate(cardPrefab, transform);
+
+            // Position & scale FIRST so Card.Init() captures correct scale.
             card.transform.position = new Vector3(
-                start.x + col * (cardSize + padding),
-                start.y - row * (cardSize + padding),
+                start.x + colIdx * (cardW + gap),
+                start.y - row * (cardH + gap),
                 0f
             );
-            float scaleFactor = cardSize / cardPrefab.sr.bounds.size.x;
             card.transform.localScale = Vector3.one * scaleFactor;
 
-            int id = ids[index];
-            card.Init(id, frontSprites[id], backSprite, this);
+            // Init AFTER scaling (captures originalScale correctly)
+            int id = ids[i];
+            card.Init(id, frontSprites[id], backSprite, this, scaleFactor);
+
             cards.Add(card);
         }
     }
 
+    private void CachePrefabDesignSize()
+    {
+        prefabDesignW = 1f;
+        prefabDesignH = 1f;
+
+        if (!cardPrefab) return;
+
+        // Prefer collider
+        BoxCollider2D col = cardPrefab.GetComponent<BoxCollider2D>();
+        if (col)
+        {
+            prefabDesignW = Mathf.Abs(col.size.x);
+            prefabDesignH = Mathf.Abs(col.size.y);
+            if (prefabDesignW > 0f && prefabDesignH > 0f) return;
+        }
+
+        // Fallback sprite
+        var sr = cardPrefab.GetComponentInChildren<SpriteRenderer>();
+        if (sr && sr.sprite)
+        {
+            prefabDesignW = Mathf.Abs(sr.sprite.bounds.size.x);
+            prefabDesignH = Mathf.Abs(sr.sprite.bounds.size.y);
+        }
+
+        if (prefabDesignW <= 0f) prefabDesignW = 1f;
+        if (prefabDesignH <= 0f) prefabDesignH = prefabDesignW;
+    }
+
+    private void PrepareLevelSprites()
+    {
+        // Shuffle frontSprites so new level uses a new random order of sprites
+        for (int i = frontSprites.Count - 1; i > 0; i--)
+        {
+            int randomIndex = UnityEngine.Random.Range(0, i + 1);
+            (frontSprites[i], frontSprites[randomIndex]) = (frontSprites[randomIndex], frontSprites[i]);
+        }
+    }
     private void ClearBoard()
     {
         foreach (var c in cards)
-        {
             if (c) Destroy(c.gameObject);
-        }
+
         cards.Clear();
         comparisonQueue.Clear();
         comparisonWorkerRunning = false;
@@ -185,9 +293,7 @@ public class GameManager : MonoBehaviour
     private void TryStartComparisonWorker()
     {
         if (!comparisonWorkerRunning)
-        {
             StartCoroutine(ComparisonWorker());
-        }
     }
 
     private IEnumerator ComparisonWorker()
@@ -195,50 +301,38 @@ public class GameManager : MonoBehaviour
         comparisonWorkerRunning = true;
         while (comparisonQueue.Count >= 2)
         {
-            // Pull earliest two *currently unreconciled* cards
-            Card first = null;
-            Card second = null;
-
-            // Because player can open many, we need to pick two distinct unmatched, revealed cards
-            first = DequeueNextActive();
-            second = DequeueNextActive();
-
+            Card first = DequeueNextActive();
+            Card second = DequeueNextActive();
             if (first == null || second == null)
-            {
-                // Not enough valid cards, break loop.
                 break;
-            }
 
-            // Compare
             if (first.CardID == second.CardID)
             {
                 first.MarkMatched();
                 second.MarkMatched();
                 combo++;
-                int comboMultiplier = 1 + (combo - 1) * comboIncrement; // e.g., 1,2,3...
+                int comboMultiplier = 1 + (combo - 1) * comboIncrement;
                 AddScore(baseMatchPoints * comboMultiplier);
                 PlayMatchSfx();
             }
             else
             {
-                // Mismatch: schedule both to flip back after delay while allowing further flips
                 StartCoroutine(DelayedFlipBack(first, second));
                 combo = 0;
                 AddScore(mismatchPenalty);
                 PlayMismatchSfx();
             }
 
-            // Allow a frame so new flips can enqueue
             yield return null;
         }
 
         comparisonWorkerRunning = false;
 
-        // If everything matched -> game over
+        // Level cleared?
         if (!gameFinished && cards.All(c => c.IsMatched))
         {
             gameFinished = true;
-            PlayGameOverSfx();
+            StartCoroutine(LevelCompleteRoutine());
         }
     }
 
@@ -266,7 +360,6 @@ public class GameManager : MonoBehaviour
         score += delta;
         if (score < 0) score = 0;
         Persist();
-        // (Hook to UI Text or TMP if you later add one.)
         Debug.Log($"Score: {score}  Combo: {combo}");
     }
 
@@ -280,12 +373,13 @@ public class GameManager : MonoBehaviour
     #region Save / Load
     private void Persist()
     {
-        SaveData data = new SaveData
+        SaveData data = new()
         {
             rows = rows,
             cols = columns,
             score = score,
             combo = combo,
+            levelIndex = currentLevelIndex,
             cardIDs = cards.Select(c => c.CardID).ToArray(),
             matched = cards.Select(c => c.IsMatched).ToArray()
         };
@@ -297,10 +391,11 @@ public class GameManager : MonoBehaviour
         var data = SaveSystem.Load();
         if (data == null)
         {
-            NewGame(rows, columns);
+            StartLevel(0);
             return;
         }
 
+        currentLevelIndex = data.levelIndex;
         rows = data.rows;
         columns = data.cols;
         ClearBoard();
@@ -310,26 +405,21 @@ public class GameManager : MonoBehaviour
         score = data.score;
         combo = data.combo;
 
-        // Re-apply matched states (flip them face-up instantly)
+        // restore matched states
         for (int i = 0; i < cards.Count && i < data.matched.Length; i++)
         {
             if (data.matched[i])
             {
                 var card = cards[i];
-                // Force reveal instantly
-                var sr = card.sr;
-                sr.sprite = frontSprites[card.CardID];
-                typeof(Card).GetField("IsFlipped", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public)?.SetValue(card, true);
-                typeof(Card).GetField("IsMatched", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public)?.SetValue(card, true);
+                card.RevealInstant(frontSprites[card.CardID]);
                 card.MarkMatched();
             }
         }
         gameFinished = cards.All(c => c.IsMatched);
-        Debug.Log($"Loaded game. Score {score}, Combo {combo}");
+        Debug.Log($"Loaded game. Score {score}, Combo {combo}, Level {currentLevelIndex}");
     }
     #endregion
 }
-
 
 [Serializable]
 public class SaveData
@@ -338,6 +428,7 @@ public class SaveData
     public int cols;
     public int score;
     public int combo;
+    public int levelIndex;   // new
     public int[] cardIDs;
     public bool[] matched;
 }

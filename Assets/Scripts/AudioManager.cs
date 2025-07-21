@@ -5,7 +5,7 @@ using UnityEngine;
 public class AudioManager : MonoBehaviour
 {
     public static AudioManager Instance { get; private set; }
-    private AudioSource oneShotSource;
+    [SerializeField] private AudioSource oneShotSource;
 
     private void Awake()
     {
@@ -16,7 +16,7 @@ public class AudioManager : MonoBehaviour
         }
         Instance = this;
         DontDestroyOnLoad(gameObject);
-        oneShotSource = gameObject.AddComponent<AudioSource>();
+
         oneShotSource.playOnAwake = false;
     }
 

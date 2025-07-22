@@ -1,14 +1,19 @@
+using AssetKits.ParticleImage;
 using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using UnityEngine;
+using UnityEngine.UIElements;
 
 /// <summary>
 /// Responsive screen-fit board; gameplay, scoring, save/load, SFX, and level progression.
 /// </summary>
 public class GameManager : MonoBehaviour
 {
+    public static GameManager Instance;
+
+
     [Header("Board Config (fallback if no Level Sequence)")]
     public int rows = 4;
     public int columns = 3;
@@ -21,9 +26,9 @@ public class GameManager : MonoBehaviour
 
     [Header("Level Sequence (optional)")]
     [Tooltip("Add row/column pairs here to define progressive levels. If empty, rows/columns above are reused every level.")]
-    public List<Vector2Int> levelLayouts = new();     // e.g., (2x2), (2x3), (3x4), (4x5)...
-    public bool loopSequence = true;                   // wrap after last?
-    private int currentLevelIndex = 0;
+    public List<Vector2Int> levelLayouts = new();
+    public bool loopSequence = true;
+    public int currentLevelIndex { get; private set; } = 0;
 
     [Header("Assets")]
     public Card cardPrefab;
@@ -47,36 +52,56 @@ public class GameManager : MonoBehaviour
     [Header("Debug")]
     public bool clearSaveOnStart = false;
 
-    // Public state
-    public bool InputAllowed { get; private set; } = true;
+    [Header("Particle")]
+    public ParticleImage confetiFullScreen;
 
-    // Internal
+
+    public bool InputAllowed { get; set; } = true;
+
+
     private readonly List<Card> cards = new();
     private readonly Queue<Card> comparisonQueue = new();
     private bool comparisonWorkerRunning;
 
-    private int score;
+    public int score { get; private set; }
     private int combo;
     private bool gameFinished;
+    public static bool hasSaveData;
+
 
     // Prefab design size (unscaled)
     private float prefabDesignW = 1f;
     private float prefabDesignH = 1f;
 
+    public static Action LevelCompleteAction;
+    public static Action<int, int> ScoreUpdateAction;
+
+
     private void Awake()
     {
-        CachePrefabDesignSize();
-    }
+        if (Instance != null && Instance != this)
+        {
+            Destroy(gameObject);
+            return;
+        }
+        Instance = this;
 
-    private void Start()
-    {
+
+        CachePrefabDesignSize();
+
+
         if (clearSaveOnStart) SaveSystem.Clear();
 
         if (autoLoad && SaveSystem.HasSave())
-            LoadGame();
-        else
-            StartLevel(currentLevelIndex); // start from 0
+        {
+            if (!gameFinished)
+            {
+                hasSaveData = true;
+            }
+        }
+
     }
+
 
     #region Level Management
     private Vector2Int GetLayoutForLevel(int levelIdx)
@@ -88,17 +113,34 @@ public class GameManager : MonoBehaviour
         }
         return new Vector2Int(rows, columns);
     }
+
+    public void StartNewGame()
+    {
+        StartLevel(0);
+    }
+
+
+    public void ContinueGame()
+    {
+        LoadGame();
+        ScoreUpdateAction?.Invoke(score, combo);
+    }
+
+
+
+
+
     private void StartLevel(int levelIdx)
     {
         currentLevelIndex = Mathf.Max(0, levelIdx);
         Vector2Int layout = GetLayoutForLevel(currentLevelIndex);
 
-        PrepareLevelSprites(); // Ensure a different sprite set/order
+        PrepareLevelSprites();
         NewGame(layout.x, layout.y);
     }
     private void AdvanceLevel()
     {
-        int next = currentLevelIndex + 1;
+        int next = currentLevelIndex;
         if (levelLayouts != null && levelLayouts.Count > 0)
         {
             if (next >= levelLayouts.Count)
@@ -106,7 +148,7 @@ public class GameManager : MonoBehaviour
         }
         else
         {
-            // no sequence defined: reuse same layout
+
             next = 0;
         }
 
@@ -116,11 +158,22 @@ public class GameManager : MonoBehaviour
     private IEnumerator LevelCompleteRoutine()
     {
         InputAllowed = false;
-        PlayGameOverSfx(); // end board SFX
-        yield return new WaitForSeconds(1.0f); // short pause so player can see board cleared
+        PlayGameOverSfx();
+        yield return new WaitForSeconds(1.0f);
+        ClearBoard();
+        currentLevelIndex++;
+        SaveGameData();
+        LevelCompleteAction?.Invoke();
+    }
+
+    private void PlayNextLevel()
+    {
+        confetiFullScreen.Stop();
         InputAllowed = true;
         AdvanceLevel();
+
     }
+
     #endregion
 
     public void NewGame(int r, int c)
@@ -159,12 +212,10 @@ public class GameManager : MonoBehaviour
         score = 0;
         combo = 0;
         gameFinished = false;
-        Persist();
+        SaveGameData();
     }
 
-    /// <summary>
-    /// Instantiate, screen-fit scale, position, and init all cards.
-    /// </summary>
+
     private void CreateAndPlaceCards(List<int> ids)
     {
         Camera cam = Camera.main;
@@ -174,46 +225,45 @@ public class GameManager : MonoBehaviour
             return;
         }
 
-        // Camera world size
+
         float worldH = 2f * cam.orthographicSize;
         float worldW = worldH * cam.aspect;
 
-        // Margins
+
         float margin = Mathf.Clamp01(screenMarginPercent);
         float usableW = worldW * (1f - margin * 2f);
         float usableH = worldH * (1f - margin * 2f);
 
-        // Prefab aspect
-        float aspect = prefabDesignH / prefabDesignW; // height per 1 width
+        float aspect = prefabDesignH / prefabDesignW;
 
-        // Solve card width from width constraint
+
         float gapFrac = Mathf.Clamp01(gapPercent);
         float denomW = columns + (columns - 1) * gapFrac;
         float cardW_fromWidth = usableW / denomW;
 
-        // Solve card width from height constraint (height uses aspect)
+
         float denomH = (rows + (rows - 1) * gapFrac) * aspect;
         float cardW_fromHeight = usableH / denomH;
 
-        // Choose min to fit both
+
         float cardW = Mathf.Min(cardW_fromWidth, cardW_fromHeight);
         float cardH = cardW * aspect;
         float gap = cardW * gapFrac;
 
-        // Total board size
+
         float totalW = columns * cardW + (columns - 1) * gap;
         float totalH = rows * cardH + (rows - 1) * gap;
 
-        // Top-left start (center grid)
+
         Vector2 start = new(
             -totalW * 0.5f + cardW * 0.5f,
             totalH * 0.5f - cardH * 0.5f
         );
 
-        // Scale factor to convert prefab width to cardW
-        float scaleFactor = (cardW / prefabDesignW)/2;
 
-        // Instantiate & place
+        float scaleFactor = (cardW / prefabDesignW) / 1.5f;
+
+
         for (int i = 0; i < ids.Count; i++)
         {
             int row = i / columns;
@@ -221,7 +271,7 @@ public class GameManager : MonoBehaviour
 
             Card card = Instantiate(cardPrefab, transform);
 
-            // Position & scale FIRST so Card.Init() captures correct scale.
+
             card.transform.position = new Vector3(
                 start.x + colIdx * (cardW + gap),
                 start.y - row * (cardH + gap),
@@ -229,7 +279,7 @@ public class GameManager : MonoBehaviour
             );
             card.transform.localScale = Vector3.one * scaleFactor;
 
-            // Init AFTER scaling (captures originalScale correctly)
+
             int id = ids[i];
             card.Init(id, frontSprites[id], backSprite, this, scaleFactor);
 
@@ -332,9 +382,15 @@ public class GameManager : MonoBehaviour
         if (!gameFinished && cards.All(c => c.IsMatched))
         {
             gameFinished = true;
+            confetiFullScreen.Play();
             StartCoroutine(LevelCompleteRoutine());
+
+
         }
     }
+
+
+
 
     private Card DequeueNextActive()
     {
@@ -352,15 +408,16 @@ public class GameManager : MonoBehaviour
         yield return new WaitForSeconds(mismatchFlipBackDelay);
         a.ForceFlipBack();
         b.ForceFlipBack();
-        Persist();
+        SaveGameData();
     }
 
     private void AddScore(int delta)
     {
         score += delta;
         if (score < 0) score = 0;
-        Persist();
+        SaveGameData();
         Debug.Log($"Score: {score}  Combo: {combo}");
+        ScoreUpdateAction?.Invoke(score, combo);
     }
 
     #region Audio Helpers
@@ -371,7 +428,7 @@ public class GameManager : MonoBehaviour
     #endregion
 
     #region Save / Load
-    private void Persist()
+    private void SaveGameData()
     {
         SaveData data = new()
         {
@@ -391,6 +448,7 @@ public class GameManager : MonoBehaviour
         var data = SaveSystem.Load();
         if (data == null)
         {
+            Debug.LogError("The Datawas null");
             StartLevel(0);
             return;
         }
@@ -399,8 +457,14 @@ public class GameManager : MonoBehaviour
         rows = data.rows;
         columns = data.cols;
         ClearBoard();
-
-        CreateAndPlaceCards(data.cardIDs.ToList());
+        if (data.cardIDs.Length > 0)
+        {
+            CreateAndPlaceCards(data.cardIDs.ToList());
+        }
+        else
+        {
+            StartLevel(currentLevelIndex);
+        }
 
         score = data.score;
         combo = data.combo;
@@ -419,6 +483,39 @@ public class GameManager : MonoBehaviour
         Debug.Log($"Loaded game. Score {score}, Combo {combo}, Level {currentLevelIndex}");
     }
     #endregion
+
+    private void OnEnable()
+    {
+        UiManager.NewGameAction += StartNewGame;
+        UiManager.ContinueGameAction += ContinueGame;
+        UiManager.NextLevelAction += PlayNextLevel;
+        UiManager.ClearBoardAction += ClearBoard;
+    }
+
+    private void OnDisable()
+    {
+        UiManager.NewGameAction -= StartNewGame;
+        UiManager.ContinueGameAction -= ContinueGame;
+        UiManager.NextLevelAction -= PlayNextLevel;
+        UiManager.ClearBoardAction -= ClearBoard;
+    }
+
+
+
+
+    private void OnApplicationPause(bool pause)
+    {
+        if (pause)
+        {
+            SaveGameData();
+        }
+    }
+
+    public void OnApplicationQuit()
+    {
+        SaveGameData();
+    }
+
 }
 
 [Serializable]
@@ -428,7 +525,7 @@ public class SaveData
     public int cols;
     public int score;
     public int combo;
-    public int levelIndex;   // new
+    public int levelIndex;
     public int[] cardIDs;
     public bool[] matched;
 }
